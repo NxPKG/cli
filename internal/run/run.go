@@ -1,0 +1,515 @@
+package run
+
+import (
+	gocontext "context"
+	"fmt"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/nxpkg/cli/internal/analytics"
+	"github.com/nxpkg/cli/internal/cache"
+	"github.com/nxpkg/cli/internal/ci"
+	"github.com/nxpkg/cli/internal/cmdutil"
+	"github.com/nxpkg/cli/internal/context"
+	"github.com/nxpkg/cli/internal/core"
+	"github.com/nxpkg/cli/internal/daemon"
+	"github.com/nxpkg/cli/internal/daemonclient"
+	"github.com/nxpkg/cli/internal/env"
+	"github.com/nxpkg/cli/internal/fs"
+	"github.com/nxpkg/cli/internal/graph"
+	"github.com/nxpkg/cli/internal/process"
+	"github.com/nxpkg/cli/internal/runsummary"
+	"github.com/nxpkg/cli/internal/scm"
+	"github.com/nxpkg/cli/internal/scope"
+	"github.com/nxpkg/cli/internal/signals"
+	"github.com/nxpkg/cli/internal/taskhash"
+	"github.com/nxpkg/cli/internal/nxpkgstate"
+	"github.com/nxpkg/cli/internal/ui"
+	"github.com/nxpkg/cli/internal/util"
+
+	"github.com/pkg/errors"
+)
+
+// ExecuteRun executes the run command
+func ExecuteRun(ctx gocontext.Context, helper *cmdutil.Helper, signalWatcher *signals.Watcher, executionState *nxpkgstate.ExecutionState) error {
+	base, err := helper.GetCmdBase(executionState)
+	if err != nil {
+		return err
+	}
+	LogTag(base.Logger)
+	tasks := executionState.CLIArgs.Command.Run.Tasks
+	passThroughArgs := executionState.CLIArgs.Command.Run.PassThroughArgs
+	opts, err := optsFromArgs(&executionState.CLIArgs)
+	if err != nil {
+		return err
+	}
+
+	opts.runOpts.PassThroughArgs = passThroughArgs
+	run := configureRun(base, opts, signalWatcher)
+	if err := run.run(ctx, tasks, executionState); err != nil {
+		base.LogError("run failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+func optsFromArgs(args *nxpkgstate.ParsedArgsFromRust) (*Opts, error) {
+	runPayload := args.Command.Run
+
+	opts := getDefaultOptions()
+	// aliases := make(map[string]string)
+	if err := scope.OptsFromArgs(&opts.scopeOpts, args); err != nil {
+		return nil, err
+	}
+
+	opts.cacheOpts.SkipFilesystem = runPayload.RemoteOnly
+	opts.cacheOpts.OverrideDir = runPayload.CacheDir
+	opts.cacheOpts.Workers = runPayload.CacheWorkers
+
+	// Run flags
+	opts.runOpts.LogPrefix = runPayload.LogPrefix
+	opts.runOpts.Summarize = runPayload.Summarize
+	opts.runOpts.ExperimentalSpaceID = runPayload.ExperimentalSpaceID
+	opts.runOpts.EnvMode = runPayload.EnvMode
+	opts.runOpts.FrameworkInference = runPayload.FrameworkInference
+
+	// Runcache flags
+	opts.runcacheOpts.SkipReads = runPayload.Force
+	opts.runcacheOpts.SkipWrites = runPayload.NoCache
+
+	if runPayload.OutputLogs != "" {
+		err := opts.runcacheOpts.SetTaskOutputMode(runPayload.OutputLogs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Run flags
+	if runPayload.Concurrency != "" {
+		concurrency, err := util.ParseConcurrency(runPayload.Concurrency)
+		if err != nil {
+			return nil, err
+		}
+		opts.runOpts.Concurrency = concurrency
+	}
+
+	opts.runOpts.Parallel = runPayload.Parallel
+	opts.runOpts.Profile = runPayload.Profile
+	opts.runOpts.ContinueOnError = runPayload.ContinueExecution
+	opts.runOpts.Only = runPayload.Only
+	opts.runOpts.NoDaemon = runPayload.NoDaemon
+	opts.runOpts.SinglePackage = args.Command.Run.SinglePackage
+	opts.runOpts.LogOrder = args.Command.Run.LogOrder
+
+	// See comment on Graph in nxpkgstate.go for an explanation on Graph's representation.
+	// If flag is passed...
+	if runPayload.Graph != nil {
+		// If no value is attached, we print to stdout
+		if *runPayload.Graph == "" {
+			opts.runOpts.GraphDot = true
+		} else {
+			// Otherwise, we emit to the file name attached as value
+			opts.runOpts.GraphDot = false
+			opts.runOpts.GraphFile = *runPayload.Graph
+		}
+	}
+
+	if runPayload.DryRun != "" {
+		opts.runOpts.DryRunJSON = runPayload.DryRun == _dryRunJSONValue
+
+		if runPayload.DryRun == _dryRunTextValue || runPayload.DryRun == _dryRunJSONValue {
+			opts.runOpts.DryRun = true
+		} else {
+			return nil, fmt.Errorf("invalid dry-run mode: %v", runPayload.DryRun)
+		}
+	}
+
+	return opts, nil
+}
+
+func configureRun(base *cmdutil.CmdBase, opts *Opts, signalWatcher *signals.Watcher) *run {
+	if opts.runOpts.LogOrder == "auto" && ci.Constant() == "GITHUB_ACTIONS" {
+		opts.runOpts.LogOrder = "grouped"
+		if opts.runOpts.LogPrefix != "task" {
+			opts.runOpts.LogPrefix = "none"
+		}
+		opts.runOpts.IsGithubActions = true
+	}
+
+	processes := process.NewManager(base.Logger.Named("processes"))
+	signalWatcher.AddOnClose(processes.Close)
+	return &run{
+		base:      base,
+		opts:      opts,
+		processes: processes,
+	}
+}
+
+type run struct {
+	base      *cmdutil.CmdBase
+	opts      *Opts
+	processes *process.Manager
+}
+
+func (r *run) run(ctx gocontext.Context, targets []string, executionState *nxpkgstate.ExecutionState) error {
+	startAt := time.Now()
+	packageJSONPath := r.base.RepoRoot.UntypedJoin("package.json")
+	rootPackageJSON, err := fs.ReadPackageJSON(packageJSONPath)
+	if err != nil {
+		return fmt.Errorf("failed to read package.json: %w", err)
+	}
+
+	var pkgDepGraph *context.Context
+	if r.opts.runOpts.SinglePackage {
+		pkgDepGraph, err = context.SinglePackageGraph(rootPackageJSON, executionState.PackageManager)
+	} else {
+		pkgDepGraph, err = context.BuildPackageGraph(r.base.RepoRoot, rootPackageJSON, executionState.PackageManager)
+	}
+
+	if err != nil {
+		var warnings *context.Warnings
+		if errors.As(err, &warnings) {
+			r.base.LogWarning("Issues occurred when constructing package graph. Nxpkg will function, but some features may not be available", err)
+		} else {
+			return err
+		}
+	}
+
+	if ui.IsCI && !r.opts.runOpts.NoDaemon {
+		r.base.Logger.Debug("skipping nxpkgd since we appear to be in a non-interactive context")
+	} else if !r.opts.runOpts.NoDaemon {
+		nxpkgdClient, err := daemon.GetClient(ctx, r.base.RepoRoot, r.base.Logger, r.base.NxpkgVersion, daemon.ClientOpts{})
+		if err != nil {
+			r.base.LogWarning("", errors.Wrap(err, "failed to contact nxpkgd. Continuing in standalone mode"))
+		} else {
+			defer func() { _ = nxpkgdClient.Close() }()
+			r.base.Logger.Debug("running in daemon mode")
+			daemonClient := daemonclient.New(nxpkgdClient)
+			r.opts.runcacheOpts.OutputWatcher = daemonClient
+		}
+	}
+
+	if err := util.ValidateGraph(&pkgDepGraph.WorkspaceGraph); err != nil {
+		return errors.Wrap(err, "Invalid package dependency graph")
+	}
+
+	// TODO: consolidate some of these arguments
+	// Note: not all properties are set here. GlobalHash and Pipeline keys are set later
+	g := &graph.CompleteGraph{
+		WorkspaceGraph:  pkgDepGraph.WorkspaceGraph,
+		WorkspaceInfos:  pkgDepGraph.WorkspaceInfos,
+		RootNode:        pkgDepGraph.RootNode,
+		TaskDefinitions: map[string]*fs.TaskDefinition{},
+		RepoRoot:        r.base.RepoRoot,
+	}
+
+	nxpkgJSON, err := g.GetNxpkgConfigFromWorkspace(util.RootPkgName, r.opts.runOpts.SinglePackage)
+	if err != nil {
+		return err
+	}
+
+	r.opts.cacheOpts.Signature = r.base.Config.Signature
+
+	// If a spaceID wasn't passed as a flag, read it from the nxpkg.json config.
+	// If that is not set either, we'll still end up with a blank string.
+	if r.opts.runOpts.ExperimentalSpaceID == "" {
+		r.opts.runOpts.ExperimentalSpaceID = nxpkgJSON.SpaceID
+	}
+
+	pipeline := nxpkgJSON.Pipeline
+	g.Pipeline = pipeline
+	scmInstance, err := scm.FromInRepo(r.base.RepoRoot)
+	if err != nil {
+		if errors.Is(err, scm.ErrFallback) {
+			r.base.Logger.Debug("", err)
+		} else {
+			return errors.Wrap(err, "failed to create SCM")
+		}
+	}
+	filteredPkgs, isAllPackages, err := scope.ResolvePackages(&r.opts.scopeOpts, r.base.RepoRoot, scmInstance, pkgDepGraph, r.base.UI, r.base.Logger)
+	if err != nil {
+		return errors.Wrap(err, "failed to resolve packages to run")
+	}
+	if isAllPackages {
+		// if there is a root task for any of our targets, we need to add it
+		for _, target := range targets {
+			key := util.RootTaskID(target)
+			if _, ok := pipeline[key]; ok {
+				filteredPkgs.Add(util.RootPkgName)
+				// we only need to know we're running a root task once to add it for consideration
+				break
+			}
+		}
+	}
+
+	envAtExecutionStart := env.GetEnvMap()
+
+	globalHashInputs, err := getGlobalHashInputs(
+		r.base.Logger,
+		r.base.RepoRoot,
+		rootPackageJSON,
+		pkgDepGraph.PackageManager,
+		pkgDepGraph.Lockfile,
+		nxpkgJSON.GlobalDeps,
+		envAtExecutionStart,
+		nxpkgJSON.GlobalEnv,
+		nxpkgJSON.GlobalPassThroughEnv,
+		r.opts.runOpts.EnvMode,
+		r.opts.runOpts.FrameworkInference,
+		nxpkgJSON.GlobalDotEnv,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to collect global hash inputs: %v", err)
+	}
+
+	if globalHash, err := calculateGlobalHashFromHashableInputs(globalHashInputs); err == nil {
+		r.base.Logger.Debug("global hash", "value", globalHash)
+		if executionState.GlobalHash != nil {
+			if *executionState.GlobalHash != globalHash {
+				return fmt.Errorf("global hash differs between Rust and Go: rust %v go %v", executionState.GlobalHash, globalHash)
+			}
+			r.base.Logger.Debug("global hash matches between Rust and Go")
+		}
+
+		g.GlobalHash = globalHash
+	} else {
+		return fmt.Errorf("failed to calculate global hash: %v", err)
+	}
+
+	r.base.Logger.Debug("local cache folder", "path", r.opts.cacheOpts.OverrideDir)
+
+	rs := &runSpec{
+		Targets:      targets,
+		FilteredPkgs: filteredPkgs,
+		Opts:         r.opts,
+	}
+	packageManager := pkgDepGraph.PackageManager
+
+	engine, err := buildTaskGraphEngine(
+		g,
+		rs,
+		r.opts.runOpts.SinglePackage,
+	)
+
+	if err != nil {
+		return errors.Wrap(err, "error preparing engine")
+	}
+
+	taskHashTracker := taskhash.NewTracker(
+		g.RootNode,
+		g.GlobalHash,
+		envAtExecutionStart,
+		// TODO(mehulkar): remove g.Pipeline, because we need to get task definitions from CompleteGraph instead
+		g.Pipeline,
+	)
+
+	g.TaskHashTracker = taskHashTracker
+
+	// CalculateFileHashes assigns PackageInputsExpandedHashes as a side-effect
+	err = taskHashTracker.CalculateFileHashes(
+		engine.TaskGraph.Vertices(),
+		rs.Opts.runOpts.Concurrency,
+		g.WorkspaceInfos,
+		g.TaskDefinitions,
+		r.base.RepoRoot,
+	)
+
+	if err != nil {
+		return errors.Wrap(err, "error hashing package files")
+	}
+
+	// If we are running in parallel, then we remove all the edges in the graph
+	// except for the root. Rebuild the task graph for backwards compatibility.
+	// We still use dependencies specified by the pipeline configuration.
+	if rs.Opts.runOpts.Parallel {
+		for _, edge := range g.WorkspaceGraph.Edges() {
+			if edge.Target() != g.RootNode {
+				g.WorkspaceGraph.RemoveEdge(edge)
+			}
+		}
+		engine, err = buildTaskGraphEngine(
+			g,
+			rs,
+			r.opts.runOpts.SinglePackage,
+		)
+		if err != nil {
+			return errors.Wrap(err, "error preparing engine")
+		}
+	}
+
+	// Graph Run
+	if rs.Opts.runOpts.GraphFile != "" || rs.Opts.runOpts.GraphDot {
+		return GraphRun(ctx, rs, engine, r.base)
+	}
+
+	packagesInScope := rs.FilteredPkgs.UnsafeListOfStrings()
+	sort.Strings(packagesInScope)
+	// Initiate analytics and cache
+	analyticsClient := r.initAnalyticsClient(ctx)
+	defer analyticsClient.CloseWithTimeout(50 * time.Millisecond)
+	nxpkgCache, err := r.initCache(ctx, rs, analyticsClient)
+
+	if err != nil {
+		if errors.Is(err, cache.ErrNoCachesEnabled) {
+			r.base.UI.Warn("No caches are enabled. You can try \"nxpkg login\", \"nxpkg link\", or ensuring you are not passing --remote-only to enable caching")
+		} else {
+			return errors.Wrap(err, "failed to set up caching")
+		}
+	}
+
+	resolvedPassThroughEnvVars, err := envAtExecutionStart.FromWildcards(globalHashInputs.passThroughEnv)
+	if err != nil {
+		return err
+	}
+
+	globalEnvMode := rs.Opts.runOpts.EnvMode
+	if globalEnvMode == util.Infer && nxpkgJSON.GlobalPassThroughEnv != nil {
+		globalEnvMode = util.Strict
+	}
+
+	// RunSummary contains information that is statically analyzable about
+	// the tasks that we expect to run based on the user command.
+	summary := runsummary.NewRunSummary(
+		startAt,
+		r.base.RepoRoot,
+		rs.Opts.scopeOpts.PackageInferenceRoot,
+		r.base.NxpkgVersion,
+		r.base.APIClient,
+		r.base.SpacesAPIClient,
+		rs.Opts.runOpts,
+		packagesInScope,
+		globalEnvMode,
+		envAtExecutionStart,
+		runsummary.NewGlobalHashSummary(
+			globalHashInputs.globalCacheKey,
+			globalHashInputs.globalFileHashMap,
+			globalHashInputs.rootExternalDepsHash,
+			globalHashInputs.env,
+			globalHashInputs.passThroughEnv,
+			globalHashInputs.dotEnv,
+			globalHashInputs.resolvedEnvVars,
+			resolvedPassThroughEnvVars,
+		),
+		rs.Opts.SynthesizeCommand(rs.Targets),
+	)
+
+	// Dry Run
+	if rs.Opts.runOpts.DryRun {
+		return DryRun(
+			ctx,
+			g,
+			rs,
+			engine,
+			taskHashTracker,
+			nxpkgCache,
+			globalEnvMode,
+			globalHashInputs.resolvedEnvVars.All,
+			resolvedPassThroughEnvVars,
+			r.base,
+			summary,
+		)
+	}
+
+	// Regular run
+	return RealRun(
+		ctx,
+		g,
+		rs,
+		engine,
+		taskHashTracker,
+		nxpkgCache,
+		globalEnvMode,
+		globalHashInputs.resolvedEnvVars.All,
+		resolvedPassThroughEnvVars,
+		packagesInScope,
+		r.base,
+		summary,
+		// Extra arg only for regular runs, dry-run doesn't get this
+		packageManager,
+		r.processes,
+		executionState,
+	)
+}
+
+func (r *run) initAnalyticsClient(ctx gocontext.Context) analytics.Client {
+	apiClient := r.base.APIClient
+	var analyticsSink analytics.Sink
+
+	if apiClient.IsLinked() {
+		analyticsSink = apiClient
+	} else {
+		r.opts.cacheOpts.SkipRemote = true
+		analyticsSink = analytics.NullSink
+	}
+
+	// After we know if its _possible_ to enable remote cache, check the config
+	// and disable it if wanted.
+	if r.base.Config.Enabled != nil {
+		r.opts.cacheOpts.SkipRemote = !*r.base.Config.Enabled
+	}
+
+	analyticsClient := analytics.NewClient(ctx, analyticsSink, r.base.Logger.Named("analytics"))
+	return analyticsClient
+}
+
+func (r *run) initCache(ctx gocontext.Context, rs *runSpec, analyticsClient analytics.Client) (cache.Cache, error) {
+	apiClient := r.base.APIClient
+	// Theoretically this is overkill, but bias towards not spamming the console
+	once := &sync.Once{}
+
+	return cache.New(rs.Opts.cacheOpts, r.base.RepoRoot, apiClient, analyticsClient, func(_cache cache.Cache, err error) {
+		// Currently the HTTP Cache is the only one that can be disabled.
+		// With a cache system refactor, we might consider giving names to the caches so
+		// we can accurately report them here.
+		once.Do(func() {
+			r.base.LogWarning("Remote Caching is unavailable", err)
+		})
+	})
+}
+
+func buildTaskGraphEngine(
+	g *graph.CompleteGraph,
+	rs *runSpec,
+	isSinglePackage bool,
+) (*core.Engine, error) {
+	engine := core.NewEngine(g, isSinglePackage)
+
+	// Note: g.Pipeline is a map, but this for loop only cares about the keys
+	for taskName := range g.Pipeline {
+		engine.AddTask(taskName)
+	}
+
+	if err := engine.Prepare(&core.EngineBuildingOptions{
+		Packages:  rs.FilteredPkgs.UnsafeListOfStrings(),
+		TaskNames: rs.Targets,
+		TasksOnly: rs.Opts.runOpts.Only,
+	}); err != nil {
+		return nil, err
+	}
+
+	// Check for cycles in the DAG.
+	if err := util.ValidateGraph(engine.TaskGraph); err != nil {
+		return nil, fmt.Errorf("Invalid task dependency graph:\n%v", err)
+	}
+
+	// Check that no tasks would be blocked by a persistent task. Note that the
+	// parallel flag ignores both concurrency and dependencies, so in that scenario
+	// we don't need to validate.
+	if !rs.Opts.runOpts.Parallel {
+		if err := engine.ValidatePersistentDependencies(g, rs.Opts.runOpts.Concurrency); err != nil {
+			return nil, fmt.Errorf("Invalid persistent task configuration:\n%v", err)
+		}
+	}
+
+	return engine, nil
+}
+
+// dry run custom flag
+// NOTE: These *must* be kept in sync with the corresponding Rust
+// enum definitions in shim/src/commands/mod.rs
+const (
+	_dryRunJSONValue = "Json"
+	_dryRunTextValue = "Text"
+)

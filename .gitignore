@@ -1,0 +1,22 @@
+/internal/nxpkgdprotocol/*.go
+
+/demo/
+/dist/
+/dist-*
+
+# Built binaries.
+/nxpkg
+/nxpkg-new
+/nxpkg-new.exe
+/nxpkg.exe
+/go-nxpkg
+/go-nxpkg.exe
+
+testbed
+
+# Windows lib files
+nxpkg.h
+nxpkg.lib
+libnxpkg.a
+libnxpkg.h
+node_modules

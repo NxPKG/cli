@@ -1,0 +1,35 @@
+project_name: nxpkg
+before:
+  hooks:
+    - make compile-protos
+    - go mod tidy
+
+dist: dist-darwin
+
+builds:
+  - id: nxpkg
+    main: ./cmd/nxpkg
+    tags:
+      - rust
+      - staticbinary
+    binary: bin/go-nxpkg
+    hooks:
+      pre:
+        - cmd: make nxpkgrepo-ffi-install-{{ .Os }}-{{ .Arch }}
+          output: true
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.CommitDate}} -X main.builtBy=goreleaser
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    env:
+      - CGO_ENABLED=1
+    targets:
+      - darwin_arm64
+      - darwin_amd64
+
+archives:
+  - format: binary
+
+release:
+  disable: true

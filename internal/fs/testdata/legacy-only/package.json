@@ -1,0 +1,7 @@
+{
+  "nxpkg": {
+    "pipeline": {
+      "build": {}
+    }
+  }
+}
